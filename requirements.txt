@@ -1,0 +1,6 @@
+yt-dlp==2025.5.22
+python-dotenv==1.0.1
+aiohttp==3.9.3
+python-magic==0.4.27
+aiofiles==23.2.1
+python-telegram-bot 

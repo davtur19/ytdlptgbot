@@ -1,0 +1,79 @@
+name: ytdlptgbot
+services:
+  telegram-bot-api:
+    image: aiogram/telegram-bot-api:latest
+    environment:
+      TELEGRAM_API_ID: ${TELEGRAM_API_ID}
+      TELEGRAM_API_HASH: ${TELEGRAM_API_HASH}
+    volumes:
+      - ./tdlib-data:/var/lib/tdlib
+    restart: unless-stopped
+    mem_limit: 256m
+    mem_reservation: 128m
+    networks:
+      - bot_network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  wireproxy:
+    image: ghcr.io/whyvl/wireproxy:latest
+    cap_add:
+      - NET_ADMIN
+      #- SYS_MODULE # uncomment if you want to load the kernel module at startup
+    command: -c /etc/wireproxy/wireproxy.conf
+    environment:
+      PUID: 1000
+      PGID: 1000
+      TZ: Europe/Rome
+    volumes:
+      - ./wireguard/wireproxy.conf:/etc/wireproxy/wireproxy.conf
+    sysctls:
+      - net.ipv4.conf.all.src_valid_mark=1
+    restart: unless-stopped
+    networks:
+      - vpn_network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  bot:
+    build: .
+    environment:
+      BOT_TOKEN: ${BOT_TOKEN}
+      ALLOWED_USERIDS: ${ALLOWED_USERIDS}
+      ADMIN_USERIDS: ${ADMIN_USERIDS}
+      ALLOWED_GROUPIDS: ${ALLOWED_GROUPIDS}
+      MAX_CONCURRENT_DOWNLOADS: ${MAX_CONCURRENT_DOWNLOADS:-3}
+      MAX_FILE_SIZE: ${MAX_FILE_SIZE:-2147483648}
+      SUPPORTED_SITES: ${SUPPORTED_SITES:-youtube,youtu.be,instagram,twitter,tiktok,facebook,reddit,pinterest,tumblr,vk,ok.ru,dailymotion,vimeo,soundcloud,twitch,bilibili,linkedin}
+      TELEGRAM_API_URL: ${TELEGRAM_API_URL:-http://telegram-bot-api:8081/bot}
+      YTDLP_PROXY: ${YTDLP_PROXY:-socks5://wireproxy:1080}
+      ENABLE_DEBUG_LOGGING: ${ENABLE_DEBUG_LOGGING:-false}
+    volumes:
+      - ./sessions:/app/sessions
+      - ./downloads:/app/downloads
+    restart: unless-stopped
+    mem_limit: 512m
+    mem_reservation: 256m
+    depends_on:
+      - telegram-bot-api
+      - wireproxy
+    networks:
+      - bot_network
+      - vpn_network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  bot_network:
+    driver: bridge
+  vpn_network:
+    driver: bridge 
