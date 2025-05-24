@@ -411,24 +411,16 @@ def format_duration(seconds: Optional[float]) -> str:
     return f'{minutes:02d}:{seconds:02d}'
 
 class ProgressFile:
-    def __init__(self, file, progress_message, total_size):
-        self.file = file
+    def __init__(self, file_path: str, progress_message, total_size: int):
+        self.file = open(file_path, 'rb')
         self.progress_message = progress_message
         self.total_size = total_size
         self.uploaded = 0
         self.last_update = datetime.now()
-        self.update_interval = timedelta(seconds=1)  # Update every second
-        self.chunk_size = CHUNK_SIZE  # Use global chunk size
+        self.update_interval = timedelta(seconds=3)  # Update every 3 seconds
+        self.last_status_text = None
 
     def read(self, size=-1):
-        # If size is -1, read the entire file
-        # If size is specified, use that size
-        # If size is not specified, use our chunk size
-        if size == -1:
-            size = self.total_size - self.uploaded
-        elif size is None:
-            size = self.chunk_size
-            
         chunk = self.file.read(size)
         if chunk:
             self.uploaded += len(chunk)
@@ -440,8 +432,14 @@ class ProgressFile:
                     f"📊 Progress: {percentage:.1f}%\n"
                     f"📦 Uploaded: {format_bytes(self.uploaded)} of {format_bytes(self.total_size)}"
                 )
-                asyncio.create_task(self.progress_message.edit_text(status_text))
-                self.last_update = now
+                if status_text != self.last_status_text:
+                    try:
+                        asyncio.create_task(self.progress_message.edit_text(status_text))
+                        self.last_status_text = status_text
+                        self.last_update = now
+                    except Exception as e:
+                        if "Message is not modified" not in str(e):
+                            logger.error(f"Error updating progress message: {e}")
         return chunk
 
     def seek(self, offset, whence=0):
@@ -452,6 +450,74 @@ class ProgressFile:
 
     def close(self):
         return self.file.close()
+
+async def stream_file(file_path: str, progress_message, total_size: int, chunk_size: int = 1024 * 1024):  # 1MB chunks
+    """Stream file in chunks to avoid loading entire file in memory."""
+    uploaded = 0
+    last_update = datetime.now()
+    update_interval = timedelta(seconds=3)  # Update every 3 seconds
+    last_status_text = None
+
+    with open(file_path, 'rb') as f:
+        while True:
+            chunk = f.read(chunk_size)
+            if not chunk:
+                break
+            
+            uploaded += len(chunk)
+            now = datetime.now()
+            if now - last_update >= update_interval:
+                percentage = (uploaded / total_size) * 100
+                status_text = (
+                    f"📤 Uploading to Telegram...\n\n"
+                    f"📊 Progress: {percentage:.1f}%\n"
+                    f"📦 Uploaded: {format_bytes(uploaded)} of {format_bytes(total_size)}"
+                )
+                if status_text != last_status_text:
+                    try:
+                        await progress_message.edit_text(status_text)
+                        last_status_text = status_text
+                        last_update = now
+                    except Exception as e:
+                        if "Message is not modified" not in str(e):
+                            logger.error(f"Error updating progress message: {e}")
+            
+            yield chunk
+
+async def monitor_upload_progress(file_path: str, progress_message, total_size: int):
+    """Monitor upload progress by checking file size changes."""
+    uploaded = 0
+    last_update = datetime.now()
+    update_interval = timedelta(seconds=3)  # Update every 3 seconds
+    last_status_text = None  # Track last status text to avoid duplicate updates
+    
+    while uploaded < total_size:
+        try:
+            # Get current file size
+            current_size = os.path.getsize(file_path)
+            if current_size > uploaded:
+                uploaded = current_size
+                now = datetime.now()
+                if now - last_update >= update_interval:
+                    percentage = (uploaded / total_size) * 100
+                    status_text = (
+                        f"📤 Uploading to Telegram...\n\n"
+                        f"📊 Progress: {percentage:.1f}%\n"
+                        f"📦 Uploaded: {format_bytes(uploaded)} of {format_bytes(total_size)}"
+                    )
+                    # Only update if status text has changed
+                    if status_text != last_status_text:
+                        try:
+                            await progress_message.edit_text(status_text)
+                            last_status_text = status_text
+                            last_update = now
+                        except Exception as e:
+                            if "Message is not modified" not in str(e):
+                                logger.error(f"Error updating progress message: {e}")
+            await asyncio.sleep(0.1)  # Small delay to prevent high CPU usage
+        except Exception as e:
+            logger.error(f"Error monitoring upload progress: {e}")
+            break
 
 async def download_media(url: str, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Download media from URL and send it to the chat."""
@@ -678,93 +744,115 @@ async def download_media(url: str, update: Update, context: ContextTypes.DEFAULT
                         
                         try:
                             async with asyncio.timeout(UPLOAD_TIMEOUT):
-                                logger.info("[DOWNLOAD_MEDIA] Opening file for upload")
-                                # File opening is also an I/O operation, run in thread
-                                with await asyncio.to_thread(open, downloaded_file, 'rb') as f:
-                                    logger.info("[DOWNLOAD_MEDIA] Sending file to Telegram")
-                                    
-                                    # Check if file is a video
-                                    mime = magic.Magic(mime=True)
-                                    file_type = mime.from_file(downloaded_file)
-                                    
-                                    # Retry logic for upload
-                                    for attempt in range(MAX_UPLOAD_RETRIES):
-                                        try:
-                                            if file_type.startswith('video/'):
-                                                logger.info(f"[DOWNLOAD_MEDIA] Sending as video (attempt {attempt + 1}/{MAX_UPLOAD_RETRIES})")
-                                                await context.bot.send_chat_action(chat_id=chat_id, action="upload_video")
-                                                await progress_message.edit_text("📤 Uploading video to Telegram...")
-                                                
-                                                await context.bot.send_video(
-                                                    chat_id=chat_id,
-                                                    video=f,
-                                                    filename=os.path.basename(downloaded_file),
-                                                    supports_streaming=True,
-                                                    read_timeout=UPLOAD_TIMEOUT,
-                                                    write_timeout=UPLOAD_TIMEOUT,
-                                                    connect_timeout=UPLOAD_TIMEOUT,
-                                                    pool_timeout=UPLOAD_TIMEOUT
-                                                )
-                                            else:
-                                                logger.info(f"[DOWNLOAD_MEDIA] Sending as document (attempt {attempt + 1}/{MAX_UPLOAD_RETRIES})")
-                                                await context.bot.send_chat_action(chat_id=chat_id, action="upload_document")
-                                                await progress_message.edit_text("📤 Uploading document to Telegram...")
-                                                
-                                                await context.bot.send_document(
-                                                    chat_id=chat_id,
-                                                    document=f,
-                                                    filename=os.path.basename(downloaded_file),
-                                                    read_timeout=UPLOAD_TIMEOUT,
-                                                    write_timeout=UPLOAD_TIMEOUT,
-                                                    connect_timeout=UPLOAD_TIMEOUT,
-                                                    pool_timeout=UPLOAD_TIMEOUT
-                                                )
-                                            break  # If successful, break the retry loop
-                                        except Exception as e:
-                                            if attempt == MAX_UPLOAD_RETRIES - 1:  # Last attempt
-                                                raise  # Re-raise the last exception
-                                            logger.warning(f"[DOWNLOAD_MEDIA] Upload attempt {attempt + 1} failed: {e}")
-                                            await asyncio.sleep(2 ** attempt)  # Exponential backoff
-                                            f.seek(0)  # Reset file pointer for next attempt
+                                logger.info("[DOWNLOAD_MEDIA] Sending file to Telegram")
                                 
-                                logger.info(f"[DOWNLOAD_MEDIA] Upload completed for user {user_id} in chat {chat_id}")
-
-                                # Update progress message to indicate completion
-                                upload_end_time = datetime.now()
-                                upload_time = upload_end_time - upload_start_time
-                                logger.info(f"[DOWNLOAD_MEDIA] Upload completed in {upload_time}")
-
-                                # Calculate total time
-                                total_time = upload_end_time - download_start_time
-                                logger.info(f"[DOWNLOAD_MEDIA] Total operation time: {total_time}")
-
-                                # Extract more metadata if info is available
-                                if info:
-                                    logger.debug("[DOWNLOAD_MEDIA] Extracting additional metadata")
-                                    file_format = info.get('format', 'N/A')
-                                    quality = info.get('format_note', 'N/A')
-                                    extension = info.get('ext', 'N/A')
-                                    resolution = info.get('resolution', 'N/A')
-                                    duration = info.get('duration', 0)
-                                    file_duration_formatted = format_duration(duration)
-                                    logger.info(f"[DOWNLOAD_MEDIA] Metadata - Format: {file_format}, Quality: {quality}, Extension: {extension}, Resolution: {resolution}, Duration: {file_duration_formatted}")
-
-                                # Create the final message text with more details
-                                final_message_text = (
-                                    f"✅ Done!\n\n"
-                                    f"📏 Size: {format_bytes(file_size_bytes)}\n"
-                                    f"⏳ Duration: {file_duration_formatted}\n"
-                                    f"⏱️ Download Time: {str(download_time).split('.')[0]}.{str(download_time).split('.')[1][:1]}s\n"
-                                    f"⏱️ Upload Time: {str(upload_time).split('.')[0]}.{str(upload_time).split('.')[1][:1]}s\n"
-                                    f"⏱️ Total Time: {str(total_time).split('.')[0]}.{str(total_time).split('.')[1][:1]}s\n"
-                                    f"📂 Format: {file_format} ({extension})\n"
-                                    f"💡 Quality: {quality}\n"
-                                    f"🖼️ Resolution: {resolution}"
+                                # Check if file is a video
+                                mime = magic.Magic(mime=True)
+                                file_type = mime.from_file(downloaded_file)
+                                
+                                # Start upload progress monitoring in background
+                                monitor_task = asyncio.create_task(
+                                    monitor_upload_progress(downloaded_file, progress_message, file_size_bytes)
                                 )
+                                
+                                # Retry logic for upload
+                                for attempt in range(MAX_UPLOAD_RETRIES):
+                                    try:
+                                        if file_type.startswith('video/'):
+                                            logger.info(f"[DOWNLOAD_MEDIA] Sending as video (attempt {attempt + 1}/{MAX_UPLOAD_RETRIES})")
+                                            await context.bot.send_chat_action(chat_id=chat_id, action="upload_video")
+                                            try:
+                                                await progress_message.edit_text("📤 Uploading video to Telegram...")
+                                            except Exception as e:
+                                                if "Message is not modified" not in str(e):
+                                                    logger.error(f"Error updating progress message: {e}")
+                                            
+                                            # Use ProgressFile for video upload
+                                            progress_file = ProgressFile(downloaded_file, progress_message, file_size_bytes)
+                                            await context.bot.send_video(
+                                                chat_id=chat_id,
+                                                video=progress_file,
+                                                filename=os.path.basename(downloaded_file),
+                                                supports_streaming=True,
+                                                read_timeout=UPLOAD_TIMEOUT,
+                                                write_timeout=UPLOAD_TIMEOUT,
+                                                connect_timeout=UPLOAD_TIMEOUT,
+                                                pool_timeout=UPLOAD_TIMEOUT
+                                            )
+                                            progress_file.close()
+                                        else:
+                                            logger.info(f"[DOWNLOAD_MEDIA] Sending as document (attempt {attempt + 1}/{MAX_UPLOAD_RETRIES})")
+                                            await context.bot.send_chat_action(chat_id=chat_id, action="upload_document")
+                                            try:
+                                                await progress_message.edit_text("📤 Uploading document to Telegram...")
+                                            except Exception as e:
+                                                if "Message is not modified" not in str(e):
+                                                    logger.error(f"Error updating progress message: {e}")
+                                            
+                                            # Use ProgressFile for document upload
+                                            progress_file = ProgressFile(downloaded_file, progress_message, file_size_bytes)
+                                            await context.bot.send_document(
+                                                chat_id=chat_id,
+                                                document=progress_file,
+                                                filename=os.path.basename(downloaded_file),
+                                                read_timeout=UPLOAD_TIMEOUT,
+                                                write_timeout=UPLOAD_TIMEOUT,
+                                                connect_timeout=UPLOAD_TIMEOUT,
+                                                pool_timeout=UPLOAD_TIMEOUT
+                                            )
+                                            progress_file.close()
+                                        break  # If successful, break the retry loop
+                                    except Exception as e:
+                                        if attempt == MAX_UPLOAD_RETRIES - 1:  # Last attempt
+                                            raise  # Re-raise the last exception
+                                        logger.warning(f"[DOWNLOAD_MEDIA] Upload attempt {attempt + 1} failed: {e}")
+                                        await asyncio.sleep(2 ** attempt)  # Exponential backoff
+                                
+                                # Cancel the monitor task after upload completes
+                                monitor_task.cancel()
+                                try:
+                                    await monitor_task
+                                except asyncio.CancelledError:
+                                    pass
+                            
+                            logger.info(f"[DOWNLOAD_MEDIA] Upload completed for user {user_id} in chat {chat_id}")
 
-                                logger.info("[DOWNLOAD_MEDIA] Sending final completion message")
-                                await progress_message.edit_text(final_message_text)
-                                logger.info(f"[DOWNLOAD_MEDIA] File successfully sent to user {user_id} in chat {chat_id}")
+                            # Update progress message to indicate completion
+                            upload_end_time = datetime.now()
+                            upload_time = upload_end_time - upload_start_time
+                            logger.info(f"[DOWNLOAD_MEDIA] Upload completed in {upload_time}")
+
+                            # Calculate total time
+                            total_time = upload_end_time - download_start_time
+                            logger.info(f"[DOWNLOAD_MEDIA] Total operation time: {total_time}")
+
+                            # Extract more metadata if info is available
+                            if info:
+                                logger.debug("[DOWNLOAD_MEDIA] Extracting additional metadata")
+                                file_format = info.get('format', 'N/A')
+                                quality = info.get('format_note', 'N/A')
+                                extension = info.get('ext', 'N/A')
+                                resolution = info.get('resolution', 'N/A')
+                                duration = info.get('duration', 0)
+                                file_duration_formatted = format_duration(duration)
+                                logger.info(f"[DOWNLOAD_MEDIA] Metadata - Format: {file_format}, Quality: {quality}, Extension: {extension}, Resolution: {resolution}, Duration: {file_duration_formatted}")
+
+                            # Create the final message text with more details
+                            final_message_text = (
+                                f"✅ Done!\n\n"
+                                f"📏 Size: {format_bytes(file_size_bytes)}\n"
+                                f"⏳ Duration: {file_duration_formatted}\n"
+                                f"⏱️ Download Time: {str(download_time).split('.')[0]}.{str(download_time).split('.')[1][:1]}s\n"
+                                f"⏱️ Upload Time: {str(upload_time).split('.')[0]}.{str(upload_time).split('.')[1][:1]}s\n"
+                                f"⏱️ Total Time: {str(total_time).split('.')[0]}.{str(total_time).split('.')[1][:1]}s\n"
+                                f"📂 Format: {file_format} ({extension})\n"
+                                f"💡 Quality: {quality}\n"
+                                f"🖼️ Resolution: {resolution}"
+                            )
+
+                            logger.info("[DOWNLOAD_MEDIA] Sending final completion message")
+                            await progress_message.edit_text(final_message_text)
+                            logger.info(f"[DOWNLOAD_MEDIA] File successfully sent to user {user_id} in chat {chat_id}")
                         except asyncio.TimeoutError:
                             logger.error("[DOWNLOAD_MEDIA] Upload timed out")
                             await progress_message.edit_text("❌ Upload timed out. Please try again.")
@@ -886,71 +974,68 @@ async def process_and_upload_file(
         
         try:
             async with asyncio.timeout(UPLOAD_TIMEOUT):
-                logger.info("[PROCESS_UPLOAD] Opening file for upload")
-                # File opening is also an I/O operation, run in thread
-                with await asyncio.to_thread(open, downloaded_file, 'rb') as f:
-                    logger.info("[PROCESS_UPLOAD] Sending file to Telegram")
-                    
-                    # Check if file is a video
-                    mime = magic.Magic(mime=True)
-                    file_type = mime.from_file(downloaded_file)
-                    
-                    if file_type.startswith('video/'):
-                        logger.info("[PROCESS_UPLOAD] Sending as video")
-                        await context.bot.send_chat_action(chat_id=chat_id, action="upload_video")
-                        await context.bot.send_video(
-                            chat_id=chat_id,
-                            video=f,
-                            filename=os.path.basename(downloaded_file),
-                            supports_streaming=True
-                        )
-                    else:
-                        logger.info("[PROCESS_UPLOAD] Sending as document")
-                        await context.bot.send_chat_action(chat_id=chat_id, action="upload_document")
-                        await context.bot.send_document(
-                            chat_id=chat_id,
-                            document=f,
-                            filename=os.path.basename(downloaded_file)
-                        )
+                logger.info("[PROCESS_UPLOAD] Sending file to Telegram")
                 
-                logger.info(f"[PROCESS_UPLOAD] Upload completed for user {user_id} in chat {chat_id}")
+                # Check if file is a video
+                mime = magic.Magic(mime=True)
+                file_type = mime.from_file(downloaded_file)
+                
+                if file_type.startswith('video/'):
+                    logger.info("[PROCESS_UPLOAD] Sending as video")
+                    await context.bot.send_chat_action(chat_id=chat_id, action="upload_video")
+                    await context.bot.send_video(
+                        chat_id=chat_id,
+                        video=stream_file(downloaded_file, progress_message, file_size_bytes),
+                        filename=os.path.basename(downloaded_file),
+                        supports_streaming=True
+                    )
+                else:
+                    logger.info("[PROCESS_UPLOAD] Sending as document")
+                    await context.bot.send_chat_action(chat_id=chat_id, action="upload_document")
+                    await context.bot.send_document(
+                        chat_id=chat_id,
+                        document=stream_file(downloaded_file, progress_message, file_size_bytes),
+                        filename=os.path.basename(downloaded_file)
+                    )
+            
+            logger.info(f"[PROCESS_UPLOAD] Upload completed for user {user_id} in chat {chat_id}")
 
-                # Update progress message to indicate completion
-                upload_end_time = datetime.now()
-                upload_time = upload_end_time - upload_start_time
-                logger.info(f"[PROCESS_UPLOAD] Upload completed in {upload_time}")
+            # Update progress message to indicate completion
+            upload_end_time = datetime.now()
+            upload_time = upload_end_time - upload_start_time
+            logger.info(f"[PROCESS_UPLOAD] Upload completed in {upload_time}")
 
-                # Calculate total time
-                total_time = upload_end_time - download_start_time
-                logger.info(f"[PROCESS_UPLOAD] Total operation time: {total_time}")
+            # Calculate total time
+            total_time = upload_end_time - download_start_time
+            logger.info(f"[PROCESS_UPLOAD] Total operation time: {total_time}")
 
-                # Extract more metadata if info is available
-                if info:
-                    logger.debug("[PROCESS_UPLOAD] Extracting additional metadata")
-                    file_format = info.get('format', 'N/A')
-                    quality = info.get('format_note', 'N/A')
-                    extension = info.get('ext', 'N/A')
-                    resolution = info.get('resolution', 'N/A')
-                    duration = info.get('duration', 0)
-                    file_duration_formatted = format_duration(duration)
-                    logger.info(f"[PROCESS_UPLOAD] Metadata - Format: {file_format}, Quality: {quality}, Extension: {extension}, Resolution: {resolution}, Duration: {file_duration_formatted}")
+            # Extract more metadata if info is available
+            if info:
+                logger.debug("[PROCESS_UPLOAD] Extracting additional metadata")
+                file_format = info.get('format', 'N/A')
+                quality = info.get('format_note', 'N/A')
+                extension = info.get('ext', 'N/A')
+                resolution = info.get('resolution', 'N/A')
+                duration = info.get('duration', 0)
+                file_duration_formatted = format_duration(duration)
+                logger.info(f"[PROCESS_UPLOAD] Metadata - Format: {file_format}, Quality: {quality}, Extension: {extension}, Resolution: {resolution}, Duration: {file_duration_formatted}")
 
-                # Create the final message text with more details
-                final_message_text = (
-                    f"✅ Done!\n\n"
-                    f"📏 Size: {format_bytes(file_size_bytes)}\n"
-                    f"⏳ Duration: {file_duration_formatted}\n"
-                    f"⏱️ Download Time: {str(download_time).split('.')[0]}.{str(download_time).split('.')[1][:1]}s\n"
-                    f"⏱️ Upload Time: {str(upload_time).split('.')[0]}.{str(upload_time).split('.')[1][:1]}s\n"
-                    f"⏱️ Total Time: {str(total_time).split('.')[0]}.{str(total_time).split('.')[1][:1]}s\n"
-                    f"📂 Format: {file_format} ({extension})\n"
-                    f"💡 Quality: {quality}\n"
-                    f"🖼️ Resolution: {resolution}"
-                )
+            # Create the final message text with more details
+            final_message_text = (
+                f"✅ Done!\n\n"
+                f"📏 Size: {format_bytes(file_size_bytes)}\n"
+                f"⏳ Duration: {file_duration_formatted}\n"
+                f"⏱️ Download Time: {str(download_time).split('.')[0]}.{str(download_time).split('.')[1][:1]}s\n"
+                f"⏱️ Upload Time: {str(upload_time).split('.')[0]}.{str(upload_time).split('.')[1][:1]}s\n"
+                f"⏱️ Total Time: {str(total_time).split('.')[0]}.{str(total_time).split('.')[1][:1]}s\n"
+                f"📂 Format: {file_format} ({extension})\n"
+                f"💡 Quality: {quality}\n"
+                f"🖼️ Resolution: {resolution}"
+            )
 
-                logger.info("[PROCESS_UPLOAD] Sending final completion message")
-                await progress_message.edit_text(final_message_text)
-                logger.info(f"[PROCESS_UPLOAD] File successfully sent to user {user_id} in chat {chat_id}")
+            logger.info("[PROCESS_UPLOAD] Sending final completion message")
+            await progress_message.edit_text(final_message_text)
+            logger.info(f"[PROCESS_UPLOAD] File successfully sent to user {user_id} in chat {chat_id}")
         except asyncio.TimeoutError:
             logger.error("[PROCESS_UPLOAD] Upload timed out")
             await progress_message.edit_text("❌ Upload timed out. Please try again.")
